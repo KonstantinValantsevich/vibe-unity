@@ -13,12 +13,27 @@
 #
 # Usage: ./claude-compile-check.sh [--include-warnings]
 
-UNITY_LOG_PATH="/mnt/c/Users/matth/AppData/Local/Unity/Editor/Editor.log"
 INCLUDE_WARNINGS=false
 SCRIPT_VERSION="1.5.2"
 PROJECT_NAME=""
 RETRY_COUNT=0
 MAX_RETRIES=2
+
+# Platform detection
+OS_TYPE="unknown"
+case "$(uname -s)" in
+    Darwin*)  OS_TYPE="macos" ;;
+    Linux*)
+        if grep -qi microsoft /proc/version 2>/dev/null; then
+            OS_TYPE="wsl"
+        else
+            OS_TYPE="linux"
+        fi
+        ;;
+esac
+
+# WSL-only: Unity log path (not used on macOS)
+UNITY_LOG_PATH="/mnt/c/Users/matth/AppData/Local/Unity/Editor/Editor.log"
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -124,6 +139,114 @@ focus_wsl() {
             [Microsoft.VisualBasic.Interaction]::AppActivate(\$cmd.Id);
         }
     }" 2>/dev/null
+}
+
+# macOS: Focus Unity window
+focus_unity_macos() {
+    osascript -e 'tell application "Unity" to activate' 2>/dev/null
+    return $?
+}
+
+# macOS: Focus terminal back
+focus_terminal_macos() {
+    local term="${TERM_PROGRAM:-Terminal}"
+    case "$term" in
+        iTerm*|iTerm2|iTerm.app)  term="iTerm2" ;;
+        Apple_Terminal)           term="Terminal" ;;
+        ghostty)                  term="Ghostty" ;;
+        *)                        term="Terminal" ;;
+    esac
+    osascript -e "tell application \"$term\" to activate" 2>/dev/null
+}
+
+# macOS: Monitor compilation via status files only
+monitor_compilation_macos() {
+    local timeout=45
+    local elapsed=0
+    local status_file=".vibe-unity/compilation/current-status.json"
+    local errors_file=".vibe-unity/compilation/last-errors.json"
+
+    # Check if status file exists
+    if [[ ! -f "$status_file" ]]; then
+        output_result "ERROR" "0" "0" "Status file not found: $status_file (is Vibe Unity installed in this project?)"
+        return 2
+    fi
+
+    while [[ $elapsed -lt $timeout ]]; do
+        local file_content=""
+        if ! file_content=$(cat "$status_file" 2>/dev/null); then
+            # File locked — compilation in progress
+            echo "Compilation in progress (status file locked)..." >&2
+            sleep 1
+            ((elapsed++))
+            continue
+        fi
+
+        # Parse status from JSON (lightweight grep, no jq dependency)
+        local status=""
+        if echo "$file_content" | grep -q '"status"[[:space:]]*:[[:space:]]*"complete"'; then
+            status="complete"
+        elif echo "$file_content" | grep -q '"status"[[:space:]]*:[[:space:]]*"compiling"'; then
+            status="compiling"
+        fi
+
+        if [[ "$status" == "complete" ]]; then
+            # Check if there were errors
+            local has_errors="false"
+            if echo "$file_content" | grep -q '"hasErrors"[[:space:]]*:[[:space:]]*true'; then
+                has_errors="true"
+            fi
+
+            local error_count=0
+            local warning_count=0
+            local details=""
+
+            # Extract counts from status file
+            if echo "$file_content" | grep -q '"errorCount"'; then
+                error_count=$(echo "$file_content" | grep -o '"errorCount"[[:space:]]*:[[:space:]]*[0-9]*' | grep -o '[0-9]*$')
+                error_count="${error_count:-0}"
+            fi
+            if echo "$file_content" | grep -q '"warningCount"'; then
+                warning_count=$(echo "$file_content" | grep -o '"warningCount"[[:space:]]*:[[:space:]]*[0-9]*' | grep -o '[0-9]*$')
+                warning_count="${warning_count:-0}"
+            fi
+
+            if [[ "$has_errors" == "true" ]] && [[ -f "$errors_file" ]]; then
+                # Read structured errors from last-errors.json
+                local errors_content=""
+                errors_content=$(cat "$errors_file" 2>/dev/null) || true
+                if [[ -n "$errors_content" ]]; then
+                    # Extract error messages (each error has file, line, message fields)
+                    details=$(echo "$errors_content" | grep -o '"message"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/"message"[[:space:]]*:[[:space:]]*"//;s/"$//' | while IFS= read -r msg; do
+                        echo "  $msg"
+                    done)
+                fi
+                output_result "ERRORS" "$error_count" "$warning_count" "$details"
+                return 1
+            else
+                local msg="Compilation completed successfully"
+                if [[ $warning_count -gt 0 ]] && [[ "$INCLUDE_WARNINGS" == "true" ]]; then
+                    msg="Compilation completed with $warning_count warning(s)"
+                fi
+                output_result "SUCCESS" "$error_count" "$warning_count" "$msg"
+                return 0
+            fi
+        elif [[ "$status" == "compiling" ]]; then
+            echo "Compiling..." >&2
+            # Extend timeout if still compiling near the end
+            if [[ $elapsed -gt $((timeout - 10)) ]]; then
+                echo "Still compiling near timeout, extending wait..." >&2
+                timeout=$((timeout + 15))
+            fi
+        fi
+
+        sleep 1
+        ((elapsed++))
+    done
+
+    # Timeout
+    output_result "ERROR" "0" "0" "Compilation timed out after ${timeout}s"
+    return 2
 }
 
 # Function to check Unity compilation status via status file
@@ -391,32 +514,53 @@ monitor_compilation() {
 main() {
     # Step 0: Detect project name
     detect_project_name
-    
+
+    if [[ "$OS_TYPE" == "macos" ]]; then
+        # macOS path: status files only, no log parsing
+        # Step 1: Focus Unity to trigger compilation
+        if ! focus_unity_macos; then
+            output_result "ERROR" "0" "0" "Failed to focus Unity. Ensure Unity is running."
+            return 2
+        fi
+
+        # Brief pause to allow Unity to process the focus
+        sleep 2
+
+        # Step 2: Focus back to terminal
+        focus_terminal_macos
+        sleep 1
+
+        # Step 3: Monitor compilation via status files
+        monitor_compilation_macos
+        return $?
+    fi
+
+    # WSL path: log parsing (unchanged)
     local result=3  # Start with retry needed
-    
+
     while [[ $result -eq 3 ]] && [[ $RETRY_COUNT -le $MAX_RETRIES ]]; do
         # Step 1: Focus Unity to trigger compilation
         if ! focus_unity; then
             output_result "ERROR" "0" "0" "Failed to focus Unity window. Ensure Unity is running."
             return 2
         fi
-        
+
         # Brief pause to allow Unity to process the focus
         sleep 2
-        
+
         # Step 2: Focus back to WSL terminal
         focus_wsl
         sleep 1
-        
+
         # Step 3: Monitor compilation and return results
         monitor_compilation
         result=$?
-        
+
         if [[ $result -eq 3 ]] && [[ $RETRY_COUNT -lt $MAX_RETRIES ]]; then
             sleep 2  # Wait before retry
         fi
     done
-    
+
     return $result
 }
 
